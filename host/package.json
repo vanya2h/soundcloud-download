@@ -1,0 +1,15 @@
+{
+  "name": "@soundcloud-dl/host",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Native messaging host for SoundCloud DL extension",
+  "main": "index.js",
+  "scripts": {
+    "start":   "node index.js",
+    "install:host": "bash install.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

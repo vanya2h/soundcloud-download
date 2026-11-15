@@ -1,0 +1,9 @@
+{
+  "name": "com.soundclouddl.host",
+  "description": "SoundCloud DL native messaging host",
+  "path": "__INSTALL_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__EXTENSION_ID__/"
+  ]
+}

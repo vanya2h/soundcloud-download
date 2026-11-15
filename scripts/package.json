@@ -1,0 +1,12 @@
+{
+  "name": "@soundcloud-dl/scripts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "node generate-icons.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
