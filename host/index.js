@@ -99,6 +99,9 @@ async function handleMessage(msg) {
 // ── Download ──────────────────────────────────────────
 
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.aiff', '.aif', '.wav', '.flac', '.m4a', '.ogg', '.opus']);
+// 30-second snippet previews from the old SC v1 fallback are always exactly 476 055 bytes at 128 kbps.
+// Any file below this threshold is treated as invalid and will be deleted / re-downloaded.
+const MIN_VALID_SIZE = 500_000;
 
 // url → Array<{downloadId, m3uPath, trackInfo}> for requests waiting on the same download
 const inflightDownloads = new Map();
@@ -113,7 +116,11 @@ function findExistingTrack(libraryDir, artist, title) {
   const base = `${san(artist)} - ${san(title)}`;
   for (const ext of AUDIO_EXTENSIONS) {
     const p = join(libraryDir, base + ext);
-    if (existsSync(p)) return p;
+    if (existsSync(p)) {
+      if (statSync(p).size >= MIN_VALID_SIZE) return p;
+      // Snippet on disk with the right name — delete it so yt-dlp re-downloads fresh.
+      try { unlinkSync(p); } catch {}
+    }
   }
 
   // Pass 2 — normalize (strip punctuation/case) and scan the directory
@@ -124,7 +131,11 @@ function findExistingTrack(libraryDir, artist, title) {
     for (const f of readdirSync(libraryDir)) {
       const ext = extname(f).toLowerCase();
       if (!AUDIO_EXTENSIONS.has(ext)) continue;
-      if (norm(basename(f, ext)) === expectedNorm) return join(libraryDir, f);
+      if (norm(basename(f, ext)) === expectedNorm) {
+        const p = join(libraryDir, f);
+        if (statSync(p).size >= MIN_VALID_SIZE) return p;
+        try { unlinkSync(p); } catch {}
+      }
     }
   } catch {}
 
@@ -166,6 +177,19 @@ async function handleDownload(msg) {
     };
     notify(downloadId, m3uPath, trackInfo);
     for (const w of waiters) notify(w.downloadId, w.m3uPath, w.trackInfo);
+  }
+
+  // If a known library path hint is provided, validate the file before invoking yt-dlp.
+  // Valid file (>= MIN_VALID_SIZE) → fast path, no yt-dlp needed.
+  // Snippet or missing → delete so yt-dlp can re-download clean.
+  if (msg.libraryPath) {
+    const lp = msg.libraryPath;
+    if (existsSync(lp) && statSync(lp).size >= MIN_VALID_SIZE) {
+      respond(id, { downloadId, status: 'started' });
+      finish(lp, true, null);
+      return;
+    }
+    if (existsSync(lp)) { try { unlinkSync(lp); } catch {} }
   }
 
   // Fast path: file already on disk — skip yt-dlp to avoid SC auth failures on re-sync.
@@ -449,6 +473,11 @@ async function handleAddToM3U(msg) {
   const { id, m3uPath, filePath, trackInfo } = msg;
   try {
     if (!m3uPath || !filePath) throw new Error('m3uPath and filePath required');
+    // If the file is a snippet (too small to be a full track), tell the caller to re-download.
+    if (existsSync(filePath) && statSync(filePath).size < MIN_VALID_SIZE) {
+      respond(id, { needsRedownload: true });
+      return;
+    }
     appendToM3U(m3uPath, filePath, trackInfo ?? {});
     respond(id, { success: true });
   } catch (err) {

@@ -281,28 +281,19 @@ async function handleMessage(msg: Record<string, unknown>): Promise<unknown> {
       const trackInfoWithUrl = { ...trackInfo, url }; // include SC URL for #SCURL: in M3U
 
       const existingPath = library[url];
-      if (existingPath) {
-        // Already in library — just append to M3U, no re-download
-        addLog('info', `Already in library: ${trackInfo.title || url}`);
-        sendToHost({ action: 'addToM3U', m3uPath: bucket.m3uPath, filePath: existingPath, trackInfo: trackInfoWithUrl })
-          .then(() => {
-            activeDownloads.delete(downloadId);
-            broadcastToScTabs({ type: 'downloadDone', downloadId, success: true,
-              track: { filename: existingPath, url, title: trackInfo.title ?? '', artist: trackInfo.artist ?? '', duration: 0, downloadedAt: new Date().toISOString() } });
-          });
-      } else {
-        addLog('info', `Queued: ${trackInfo.title || url}`);
-        dlQueued(1);
-        downloadIdToUrl.set(downloadId, url);
-        downloadIdToBucketId.set(downloadId, bucket.id);
-        if (trackInfo.title && trackInfo.artist) {
-          downloadIdToTrackInfo.set(downloadId, { title: trackInfo.title, artist: trackInfo.artist });
-        }
-        sendToHost({
-          action: 'download', url, trackInfo: trackInfoWithUrl, libraryDir, m3uPath: bucket.m3uPath,
-          downloadId, format: settings.format, quality: settings.quality, embedArt: settings.embedArt,
-        }).then(() => activeDownloads.delete(downloadId));
+      addLog('info', existingPath ? `Already in library: ${trackInfo.title || url}` : `Queued: ${trackInfo.title || url}`);
+      dlQueued(1);
+      downloadIdToUrl.set(downloadId, url);
+      downloadIdToBucketId.set(downloadId, bucket.id);
+      if (trackInfo.title && trackInfo.artist) {
+        downloadIdToTrackInfo.set(downloadId, { title: trackInfo.title, artist: trackInfo.artist });
       }
+      // Pass libraryPath hint so the host can fast-path valid files or delete snippets and re-download.
+      sendToHost({
+        action: 'download', url, trackInfo: trackInfoWithUrl, libraryDir, m3uPath: bucket.m3uPath,
+        downloadId, format: settings.format, quality: settings.quality, embedArt: settings.embedArt,
+        ...(existingPath ? { libraryPath: existingPath } : {}),
+      }).then(() => activeDownloads.delete(downloadId));
 
       return { downloadId };
     }
@@ -578,11 +569,19 @@ async function syncBucket(bucketId: string): Promise<SyncResult> {
 
     const existingPath = library[track.permalink_url];
     if (existingPath) {
-      // Already downloaded to library by another bucket — just add to this M3U
+      // Route through download with libraryPath so the host can validate the file is not a snippet.
       addLog('info', `Already in library: ${track.title}`);
+      dlQueued(1);
+      downloadIdToUrl.set(downloadId, track.permalink_url);
+      downloadIdToBucketId.set(downloadId, bucketId);
+      downloadIdToScTrackId.set(downloadId, track.id);
+      downloadIdToTrackInfo.set(downloadId, { title: track.title, artist: track.user.username });
       sendToHost({
-        action: 'addToM3U', m3uPath: bucket.m3uPath, filePath: existingPath,
+        action: 'download', url: track.permalink_url,
         trackInfo: { title: track.title, artist: track.user.username, url: track.permalink_url },
+        libraryDir, m3uPath: bucket.m3uPath, downloadId,
+        format: settings.format, quality: settings.quality, embedArt: settings.embedArt,
+        libraryPath: existingPath,
       }).then(() => activeDownloads.delete(downloadId));
     } else {
       dlQueued(1);
@@ -602,6 +601,8 @@ async function syncBucket(bucketId: string): Promise<SyncResult> {
 
   // Reconcile previously-synced tracks into the M3U. appendToM3U on the host deduplicates by
   // filepath, so this is safe to call every sync and covers cases where the M3U was out of date.
+  // If the host reports needsRedownload (file is a snippet), clear the stale library entry and
+  // queue a fresh download so the full track replaces the snippet.
   const alreadySyncedInLibrary = tracks.filter(
     (t) => syncedIds.has(String(t.id)) && library[t.permalink_url]
   );
@@ -611,6 +612,26 @@ async function syncBucket(bucketId: string): Promise<SyncResult> {
       m3uPath: bucket.m3uPath,
       filePath: library[track.permalink_url]!,
       trackInfo: { title: track.title, artist: track.user.username, url: track.permalink_url },
+    }).then((result) => {
+      if (!result['needsRedownload']) return;
+      // Stale library entry pointing to a snippet — evict it and re-download the full track.
+      libraryItem.getValue().then((lib) => {
+        const { [track.permalink_url]: _, ...rest } = lib;
+        libraryItem.setValue(rest);
+      });
+      const dlId = `sync-${bucket.id}-${track.id}`;
+      activeDownloads.add(dlId);
+      dlQueued(1);
+      downloadIdToUrl.set(dlId, track.permalink_url);
+      downloadIdToBucketId.set(dlId, bucketId);
+      downloadIdToScTrackId.set(dlId, track.id);
+      downloadIdToTrackInfo.set(dlId, { title: track.title, artist: track.user.username });
+      sendToHost({
+        action: 'download', url: track.permalink_url,
+        trackInfo: { title: track.title, artist: track.user.username, url: track.permalink_url },
+        libraryDir, m3uPath: bucket.m3uPath, downloadId: dlId,
+        format: settings.format, quality: settings.quality, embedArt: settings.embedArt,
+      }).then(() => activeDownloads.delete(dlId));
     });
   }
 
