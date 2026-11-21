@@ -8,6 +8,7 @@ import {
   fetchMyPlaylists,
   resolveScUrl,
   fetchStreamUrl,
+  fetchProgressiveStreamUrl,
   updatePlaylistTracks,
   exchangeCodeForTokens,
   refreshAccessToken,
@@ -675,14 +676,14 @@ async function tryScApiFallback(downloadId: string, originalUrl: string, bucketI
     const bucket = bucketId ? buckets.find((b) => b.id === bucketId) : null;
     if (!bucket) return false;
 
+    const clientId = settings.sc.clientId;
+    if (!clientId) return false;
     const token = await getValidToken();
 
     // Use stored track ID when available (sync downloads), otherwise resolve the URL
     let trackId = downloadIdToScTrackId.get(downloadId);
     let trackInfo = downloadIdToTrackInfo.get(downloadId);
     if (!trackId) {
-      const clientId = settings.sc.clientId;
-      if (!clientId) return false;
       const resolved = await resolveScUrl(originalUrl, clientId);
       if (!('streamable' in resolved)) return false;
       const scTrack = resolved as ScTrack;
@@ -691,7 +692,8 @@ async function tryScApiFallback(downloadId: string, originalUrl: string, bucketI
       trackInfo = { title: scTrack.title, artist: scTrack.user.username };
     }
 
-    const streamUrl = await fetchStreamUrl(trackId, token);
+    // Use v2 progressive transcoding — the v1 /stream endpoint serves 30-second snippets for some tracks
+    const streamUrl = await fetchProgressiveStreamUrl(trackId, clientId, token);
     fallbackAttempted.add(downloadId);
     sendToHost({
       action: 'downloadDirect',

@@ -1,4 +1,5 @@
 const SC_API = 'https://api.soundcloud.com';
+const SC_API_V2 = 'https://api-v2.soundcloud.com';
 
 export interface ScPlaylist {
   id: number;
@@ -91,7 +92,8 @@ export async function fetchLikedTracks(
   );
 }
 
-// Fetch the CDN stream URL for a track.
+// Fetch the CDN stream URL for a track (v1 API — may serve 30-second snippets for some tracks).
+// Used for in-app previews where a snippet is acceptable.
 // The /stream endpoint only ever returns a 302 → CDN URL with a signed token in the query string.
 // In an MV3 service worker, redirect:'manual' returns an opaque response (status 0, no headers),
 // so we must use redirect:'follow' and read res.url for the final CDN URL.
@@ -102,6 +104,35 @@ export async function fetchStreamUrl(trackId: number, accessToken: string): Prom
   const res = await fetch(`${SC_API}/tracks/${trackId}/stream`, { headers, redirect: 'follow' });
   if (!res.ok) throw new Error(`Stream unavailable (${res.status})`);
   return res.url;
+}
+
+// Fetch a full-track progressive stream URL using the v2 API transcodings.
+// Unlike the v1 /stream endpoint, this always returns the complete track (not a 30-second snip).
+// The v2 API exposes HLS and progressive transcodings; we pick progressive for a plain MP3 download.
+export async function fetchProgressiveStreamUrl(
+  trackId: number,
+  clientId: string,
+  accessToken: string,
+): Promise<string> {
+  const headers: Record<string, string> = {
+    Accept: 'application/json; charset=utf-8',
+    Authorization: `OAuth ${accessToken}`,
+  };
+
+  const trackRes = await fetch(`${SC_API_V2}/tracks/${trackId}?client_id=${clientId}`, { headers });
+  if (!trackRes.ok) throw new Error(`Track unavailable (${trackRes.status})`);
+  const track = await trackRes.json() as {
+    media?: { transcodings?: Array<{ url: string; format: { protocol: string } }> };
+  };
+
+  const progressive = (track.media?.transcodings ?? []).find((t) => t.format.protocol === 'progressive');
+  if (!progressive) throw new Error('No progressive transcoding available');
+
+  const streamRes = await fetch(`${progressive.url}?client_id=${clientId}`, { headers });
+  if (!streamRes.ok) throw new Error(`Stream URL unavailable (${streamRes.status})`);
+  const data = await streamRes.json() as { url?: string };
+  if (!data.url) throw new Error('No stream URL in response');
+  return data.url;
 }
 
 // Replace a playlist's track list (used to remove a track from a playlist)
