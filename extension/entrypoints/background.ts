@@ -24,6 +24,32 @@ const logsItem = storage.defineItem<LogEntry[]>('local:logs', { defaultValue: []
 const libraryItem = storage.defineItem<Record<string, string>>('local:library', { defaultValue: {} });
 // Dismissed track IDs (triage skip)
 const dismissedItem = storage.defineItem<number[]>('local:dismissed', { defaultValue: [] });
+// Download queue status — watched by the popup progress bar
+const dlStatusItem = storage.defineItem<{ total: number; done: number; failed: number }>('local:dlStatus', { defaultValue: { total: 0, done: 0, failed: 0 } });
+// Per-bucket failure counts — watched by the popup bucket list
+const bucketFailuresItem = storage.defineItem<Record<string, number>>('local:bucketFailures', { defaultValue: {} });
+
+let _dlTotal = 0;
+let _dlDone = 0;
+let _dlFailed = 0;
+let _dlResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+function dlQueued(n: number) {
+  if (_dlResetTimer) { clearTimeout(_dlResetTimer); _dlResetTimer = null; }
+  _dlTotal += n;
+  dlStatusItem.setValue({ total: _dlTotal, done: _dlDone, failed: _dlFailed });
+}
+
+function dlCompleted(success: boolean) {
+  if (success) _dlDone += 1; else _dlFailed += 1;
+  dlStatusItem.setValue({ total: _dlTotal, done: _dlDone, failed: _dlFailed });
+  if (_dlDone + _dlFailed >= _dlTotal) {
+    _dlResetTimer = setTimeout(() => {
+      _dlTotal = 0; _dlDone = 0; _dlFailed = 0;
+      dlStatusItem.setValue({ total: 0, done: 0, failed: 0 });
+    }, 3000);
+  }
+}
 
 async function addLog(level: LogEntry['level'], message: string) {
   const entry: LogEntry = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, time: new Date().toISOString(), level, message };
@@ -52,6 +78,7 @@ let msgId = 0;
 const pendingRequests = new Map<number, (val: unknown) => void>();
 const activeDownloads = new Set<string>();
 const downloadIdToUrl = new Map<string, string>(); // tracks original SC URL for library registry
+const downloadIdToBucketId = new Map<string, string>(); // tracks which bucket initiated the download
 
 function getPort(): browser.Runtime.Port {
   if (nativePort) return nativePort;
@@ -70,22 +97,35 @@ function getPort(): browser.Runtime.Port {
         const downloadId = msg['downloadId'] as string;
         activeDownloads.delete(downloadId);
         const track = msg['track'] as Track | undefined;
+        const originalUrl = downloadIdToUrl.get(downloadId);
+        const bucketId = downloadIdToBucketId.get(downloadId);
+
         if (msg['success']) {
-          addLog('success', `Downloaded: ${track?.title || downloadId}`);
-          // Save to global library registry so other buckets can dedup
-          const originalUrl = downloadIdToUrl.get(downloadId);
           downloadIdToUrl.delete(downloadId);
+          downloadIdToBucketId.delete(downloadId);
+          addLog('success', `Downloaded: ${track?.title || downloadId}`);
           if (originalUrl && track?.filename) {
             libraryItem.getValue().then((lib) => {
               libraryItem.setValue({ ...lib, [originalUrl]: track.filename });
             });
           }
+          dlCompleted(true);
+          broadcastToScTabs(msg as unknown as TabMessage);
         } else {
           downloadIdToUrl.delete(downloadId);
+          downloadIdToBucketId.delete(downloadId);
           addLog('error', `Download failed: ${msg['error'] as string}`);
+          if (bucketId) {
+            bucketFailuresItem.getValue().then((f) => {
+              bucketFailuresItem.setValue({ ...f, [bucketId]: (f[bucketId] ?? 0) + 1 });
+            });
+          }
+          dlCompleted(false);
+          broadcastToScTabs(msg as unknown as TabMessage);
         }
+      } else {
+        broadcastToScTabs(msg as unknown as TabMessage);
       }
-      broadcastToScTabs(msg as unknown as TabMessage);
     }
   });
 
@@ -221,7 +261,9 @@ async function handleMessage(msg: Record<string, unknown>): Promise<unknown> {
           });
       } else {
         addLog('info', `Queued: ${trackInfo.title || url}`);
+        dlQueued(1);
         downloadIdToUrl.set(downloadId, url);
+        downloadIdToBucketId.set(downloadId, bucket.id);
         sendToHost({
           action: 'download', url, trackInfo: trackInfoWithUrl, libraryDir, m3uPath: bucket.m3uPath,
           downloadId, format: settings.format, quality: settings.quality, embedArt: settings.embedArt,
@@ -341,9 +383,11 @@ async function handleMessage(msg: Record<string, unknown>): Promise<unknown> {
       return syncBucket(msg['bucketId'] as string);
 
     case 'resetBucketSync': {
-      await syncedTracksItem(msg['bucketId'] as string).setValue([]);
+      const resetId = msg['bucketId'] as string;
+      await syncedTracksItem(resetId).setValue([]);
+      await bucketFailuresItem.getValue().then((f) => bucketFailuresItem.setValue({ ...f, [resetId]: 0 }));
       addLog('info', `Sync history cleared — next sync will re-download all tracks`);
-      return syncBucket(msg['bucketId'] as string);
+      return syncBucket(resetId);
     }
 
     case 'getLogs':
@@ -449,6 +493,8 @@ async function syncBucket(bucketId: string): Promise<SyncResult> {
   const token = await getValidToken();
 
   addLog('info', `Syncing "${bucket.name}"…`);
+  // Reset per-bucket failure count at the start of each sync
+  await bucketFailuresItem.getValue().then((f) => bucketFailuresItem.setValue({ ...f, [bucketId]: 0 }));
 
   const playlist = await fetchPlaylist(bucket.playlistId, clientId, token);
   const tracks = playlist.tracks ?? [];
@@ -501,7 +547,9 @@ async function syncBucket(bucketId: string): Promise<SyncResult> {
         trackInfo: { title: track.title, artist: track.user.username, url: track.permalink_url },
       }).then(() => activeDownloads.delete(downloadId));
     } else {
+      dlQueued(1);
       downloadIdToUrl.set(downloadId, track.permalink_url);
+      downloadIdToBucketId.set(downloadId, bucketId);
       sendToHost({
         action: 'download',
         url: track.permalink_url,

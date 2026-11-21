@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { storage } from 'wxt/storage';
 import type { Bucket, Settings, Track } from '../../utils/types';
 import { sendToBackground } from '../../utils/messaging';
 import BucketList from '../../components/BucketList';
@@ -20,6 +21,20 @@ export default function App() {
     rootDir: '', format: 'mp3', quality: 'best', embedArt: true, sc: {},
   });
   const [loading, setLoading] = useState(true);
+  const [dlStatus, setDlStatus] = useState<{ total: number; done: number; failed: number }>({ total: 0, done: 0, failed: 0 });
+  const [bucketFailures, setBucketFailures] = useState<Record<string, number>>({});
+
+  useEffect(() => {
+    const dlStatusItem = storage.defineItem<{ total: number; done: number; failed: number }>('local:dlStatus', { defaultValue: { total: 0, done: 0, failed: 0 } });
+    dlStatusItem.getValue().then(setDlStatus);
+    return dlStatusItem.watch((v) => setDlStatus(v ?? { total: 0, done: 0, failed: 0 }));
+  }, []);
+
+  useEffect(() => {
+    const item = storage.defineItem<Record<string, number>>('local:bucketFailures', { defaultValue: {} });
+    item.getValue().then(setBucketFailures);
+    return item.watch((v) => setBucketFailures(v ?? {}));
+  }, []);
 
   const loadBuckets = useCallback(async () => {
     const res = await sendToBackground<{ buckets: Bucket[] }>({ action: 'getBuckets' });
@@ -95,11 +110,30 @@ export default function App() {
         </button>
       </header>
 
+      {dlStatus.total > 0 && (
+        <div className="dl-progress">
+          <div className="dl-progress__bar">
+            <div
+              className="dl-progress__fill"
+              style={{ width: `${Math.round(((dlStatus.done + dlStatus.failed) / dlStatus.total) * 100)}%` }}
+            />
+          </div>
+          <span className="dl-progress__label">
+            {dlStatus.done + dlStatus.failed < dlStatus.total
+              ? `↓ ${dlStatus.done + dlStatus.failed} / ${dlStatus.total} `
+              : null}
+            {dlStatus.done > 0 && <span className="dl-progress__ok">✓{dlStatus.done}</span>}
+            {dlStatus.failed > 0 && <span className="dl-progress__fail"> ✗{dlStatus.failed}</span>}
+          </span>
+        </div>
+      )}
+
       {view === 'buckets' && (
         <BucketList
           buckets={buckets}
           loading={loading}
           rootDir={settings.rootDir}
+          bucketFailures={bucketFailures}
           onOpen={openBucket}
           onRemove={removeBucket}
           onOpenFinder={() => sendToBackground({ action: 'openFinder', path: `${settings.rootDir}/library` })}

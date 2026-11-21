@@ -47,6 +47,36 @@ body {
 
 .app-header__brand { display: flex; align-items: center; gap: 8px; }
 
+.dl-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.dl-progress__bar {
+  flex: 1;
+  height: 4px;
+  background: var(--bg3);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.dl-progress__fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+.dl-progress__label {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.dl-progress__ok   { color: var(--success); }
+.dl-progress__fail { color: var(--danger); }
+
 .app-header__title {
   font-size: 14px;
   font-weight: 600;
@@ -505,6 +535,12 @@ body {
 .sync-result {
   font-size: 10px;
   color: var(--success);
+  white-space: nowrap;
+}
+
+.sync-failed {
+  font-size: 10px;
+  color: var(--danger);
   white-space: nowrap;
 }
 

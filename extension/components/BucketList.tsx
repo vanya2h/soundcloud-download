@@ -6,6 +6,7 @@ interface Props {
   buckets: Bucket[];
   loading: boolean;
   rootDir: string;
+  bucketFailures: Record<string, number>;
   onOpen: (b: Bucket) => void;
   onRemove: (id: string) => void;
   onOpenFinder: (b: Bucket) => void;
@@ -14,7 +15,7 @@ interface Props {
   onGoToSettings: () => void;
 }
 
-export default function BucketList({ buckets, loading, rootDir, onOpen, onRemove, onOpenFinder, onLinkPlaylist, onAdd, onGoToSettings }: Props) {
+export default function BucketList({ buckets, loading, rootDir, bucketFailures, onOpen, onRemove, onOpenFinder, onLinkPlaylist, onAdd, onGoToSettings }: Props) {
   const [syncingAll, setSyncingAll] = useState(false);
   const [syncAllResult, setSyncAllResult] = useState<number | null>(null);
 
@@ -75,6 +76,7 @@ export default function BucketList({ buckets, loading, rootDir, onOpen, onRemove
             <BucketItem
               key={b.id}
               bucket={b}
+              failedCount={bucketFailures[b.id] ?? 0}
               onOpen={() => onOpen(b)}
               onRemove={() => onRemove(b.id)}
               onOpenFinder={() => onOpenFinder(b)}
@@ -87,8 +89,9 @@ export default function BucketList({ buckets, loading, rootDir, onOpen, onRemove
   );
 }
 
-function BucketItem({ bucket, onOpen, onRemove, onOpenFinder, onLinkPlaylist }: {
+function BucketItem({ bucket, failedCount, onOpen, onRemove, onOpenFinder, onLinkPlaylist }: {
   bucket: Bucket;
+  failedCount: number;
   onOpen: () => void;
   onRemove: () => void;
   onOpenFinder: () => void;
@@ -151,6 +154,9 @@ function BucketItem({ bucket, onOpen, onRemove, onOpenFinder, onLinkPlaylist }: 
                 <span className="sync-result">
                   {syncResult.queued > 0 ? `+${syncResult.queued} queued` : 'Up to date'}
                 </span>
+              )}
+              {failedCount > 0 && (
+                <span className="sync-failed">✗{failedCount} failed</span>
               )}
             </div>
             {syncError && <div className="sync-error">⚠ {syncError}</div>}
