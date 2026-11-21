@@ -4,7 +4,7 @@
 
 import { spawn, execFile } from 'node:child_process';
 import { readFileSync, writeFileSync, appendFileSync, unlinkSync, readdirSync, statSync, existsSync, mkdirSync } from 'node:fs';
-import { join, extname, basename } from 'node:path';
+import { join, extname, basename, dirname } from 'node:path';
 import { promisify } from 'node:util';
 import http from 'node:http';
 
@@ -214,6 +214,7 @@ async function handleDownload(msg) {
 }
 
 function appendToM3U(m3uPath, filePath, track) {
+  mkdirSync(dirname(m3uPath), { recursive: true });
   const displayName = track.artist ? `${track.artist} - ${track.title}` : (track.title || basename(filePath));
   const duration = Math.round(track.duration ?? 0);
   const scLine = track.url ? `#SCURL:${track.url}\n` : '';
