@@ -3,10 +3,11 @@
 // Communicates with the extension via stdin/stdout using 4-byte LE length framing
 
 import { spawn, execFile } from 'node:child_process';
-import { readFileSync, writeFileSync, appendFileSync, unlinkSync, readdirSync, statSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, unlinkSync, readdirSync, statSync, existsSync, mkdirSync, createWriteStream, renameSync } from 'node:fs';
 import { join, extname, basename, dirname } from 'node:path';
 import { promisify } from 'node:util';
 import http from 'node:http';
+import https from 'node:https';
 
 const execFileAsync = promisify(execFile);
 
@@ -82,8 +83,9 @@ main().catch((err) => {
 
 async function handleMessage(msg) {
   switch (msg.action) {
-    case 'download':    return handleDownload(msg);
-    case 'addToM3U':       return handleAddToM3U(msg);
+    case 'download':         return handleDownload(msg);
+    case 'downloadDirect':   return handleDownloadDirect(msg);
+    case 'addToM3U':         return handleAddToM3U(msg);
     case 'removeFromM3U':  return handleRemoveFromM3U(msg);
     case 'listTracks':  return handleListTracks(msg);
     case 'openFinder':  return handleOpenFinder(msg);
@@ -98,11 +100,82 @@ async function handleMessage(msg) {
 
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.aiff', '.aif', '.wav', '.flac', '.m4a', '.ogg', '.opus']);
 
+// url → Array<{downloadId, m3uPath, trackInfo}> for requests waiting on the same download
+const inflightDownloads = new Map();
+
+// Locate an existing audio file for a track without calling yt-dlp.
+// 1. Exact match: yt-dlp sanitizes "/" → "⧸" on macOS; that covers ~99% of cases.
+// 2. Fuzzy match: strip all non-alphanumeric chars and compare — handles minor title/artist
+//    differences between the SC API response and what yt-dlp originally wrote to disk.
+function findExistingTrack(libraryDir, artist, title) {
+  // Pass 1 — exact expected filename
+  const san = (s) => s.replace(/\//g, '⧸').replace(/\0/g, '').trim();
+  const base = `${san(artist)} - ${san(title)}`;
+  for (const ext of AUDIO_EXTENSIONS) {
+    const p = join(libraryDir, base + ext);
+    if (existsSync(p)) return p;
+  }
+
+  // Pass 2 — normalize (strip punctuation/case) and scan the directory
+  const norm = (s) => s.toLowerCase().replace(/[^a-z0-9À-ɏЀ-ӿ]/g, '');
+  const expectedNorm = norm(artist) + norm(title);
+  if (expectedNorm.length < 4) return null; // too short to match safely
+  try {
+    for (const f of readdirSync(libraryDir)) {
+      const ext = extname(f).toLowerCase();
+      if (!AUDIO_EXTENSIONS.has(ext)) continue;
+      if (norm(basename(f, ext)) === expectedNorm) return join(libraryDir, f);
+    }
+  } catch {}
+
+  return null;
+}
+
 async function handleDownload(msg) {
   const { id, url, libraryDir, m3uPath, downloadId, format = 'mp3', quality = 'best', embedArt = true, trackInfo } = msg;
 
   if (!existsSync(libraryDir)) {
     mkdirSync(libraryDir, { recursive: true });
+  }
+
+  // If another bucket is already downloading this URL, piggyback: ack immediately and wait.
+  if (inflightDownloads.has(url)) {
+    respond(id, { downloadId, status: 'started' });
+    inflightDownloads.get(url).push({ downloadId, m3uPath, trackInfo });
+    return;
+  }
+
+  // Register as the primary download for this URL.
+  inflightDownloads.set(url, []);
+
+  // Notify the primary request + all registered waiters once the file path is known.
+  function finish(filePath, success, error) {
+    const waiters = inflightDownloads.get(url) ?? [];
+    inflightDownloads.delete(url);
+    const notify = (dId, mPath, tInfo) => {
+      if (filePath && mPath) appendToM3U(mPath, filePath, { ...(tInfo ?? {}), url });
+      if (success) {
+        sendMessage({ type: 'downloadDone', downloadId: dId, success: true, track: {
+          filename: filePath ?? '', url,
+          title: tInfo?.title ?? '', artist: tInfo?.artist ?? '',
+          duration: 0, downloadedAt: new Date().toISOString(),
+        }});
+      } else {
+        sendMessage({ type: 'downloadDone', downloadId: dId, success: false, error });
+      }
+    };
+    notify(downloadId, m3uPath, trackInfo);
+    for (const w of waiters) notify(w.downloadId, w.m3uPath, w.trackInfo);
+  }
+
+  // Fast path: file already on disk — skip yt-dlp to avoid SC auth failures on re-sync.
+  if (trackInfo?.artist && trackInfo?.title) {
+    const found = findExistingTrack(libraryDir, trackInfo.artist, trackInfo.title);
+    if (found) {
+      respond(id, { downloadId, status: 'started' });
+      finish(found, true, null);
+      return;
+    }
   }
 
   const qualityMap = { best: '0', '320': '320', '256': '256', '192': '192', '128': '128' };
@@ -160,10 +233,19 @@ async function handleDownload(msg) {
         sendMessage({ type: 'progress', downloadId, percent, speed: m[2], eta: m[3] });
       }
     } else {
-      // --print after_move:filepath outputs an absolute file path with an audio extension
       const trimmed = line.trim();
+      // --print after_move:filepath outputs an absolute file path with an audio extension
       if (trimmed && trimmed.startsWith('/') && AUDIO_EXTENSIONS.has(extname(trimmed).toLowerCase())) {
         capturedFilepath = trimmed;
+      }
+      // yt-dlp --no-overwrites skips existing files and prints this instead of firing after_move:
+      // "[download] /absolute/path/artist - title.mp3 has already been downloaded"
+      const skipMatch = trimmed.match(/^\[download\] (.+) has already been downloaded$/);
+      if (skipMatch) {
+        const p = skipMatch[1];
+        if (p.startsWith('/') && AUDIO_EXTENSIONS.has(extname(p).toLowerCase())) {
+          capturedFilepath = p;
+        }
       }
     }
   }
@@ -175,15 +257,25 @@ async function handleDownload(msg) {
     for (const line of lines) processLine(line);
   });
 
+  // yt-dlp routes some messages to stderr depending on version — mirror through processLine
+  let stderrBuf = '';
+  proc.stderr.on('data', (chunk) => {
+    stderrBuf += chunk.toString();
+    const lines = stderrBuf.split('\n');
+    stderrBuf = lines.pop() ?? '';
+    for (const line of lines) processLine(line);
+  });
+
   proc.on('close', async (code) => {
     if (stdoutBuf.trim()) processLine(stdoutBuf.trim());
+    if (stderrBuf.trim()) processLine(stderrBuf.trim());
 
     if (code !== 0) {
-      sendMessage({ type: 'downloadDone', downloadId, success: false, error: `yt-dlp exited with code ${code}` });
+      finish(null, false, `yt-dlp exited with code ${code}`);
       return;
     }
 
-    // Fallback: if --print after_move:filepath didn't fire (older yt-dlp or --no-overwrites skip),
+    // Fallback: if --print after_move:filepath didn't fire (older yt-dlp without after_move support),
     // find the new audio file by diffing the directory snapshot taken before the download.
     if (!capturedFilepath) {
       try {
@@ -195,21 +287,11 @@ async function handleDownload(msg) {
       } catch {}
     }
 
-    const track = {
-      filename: capturedFilepath,
-      url,
-      title: trackInfo?.title ?? '',
-      artist: trackInfo?.artist ?? '',
-      duration: 0,
-      downloadedAt: new Date().toISOString(),
-    };
-
-    if (m3uPath && track.filename) appendToM3U(m3uPath, track.filename, track);
-    sendMessage({ type: 'downloadDone', downloadId, success: true, track });
+    finish(capturedFilepath || null, true, null);
   });
 
   proc.on('error', (err) => {
-    sendMessage({ type: 'downloadDone', downloadId, success: false, error: err.message });
+    finish(null, false, err.message);
   });
 }
 
@@ -225,6 +307,64 @@ function appendToM3U(m3uPath, filePath, track) {
   } else {
     const existing = readFileSync(m3uPath, 'utf8');
     if (!existing.includes(filePath)) appendFileSync(m3uPath, entry, 'utf8');
+  }
+}
+
+// ── SC API direct download (fallback when yt-dlp fails) ──
+
+async function handleDownloadDirect(msg) {
+  const { id, url, downloadId, m3uPath, trackInfo, libraryDir } = msg;
+
+  if (!existsSync(libraryDir)) mkdirSync(libraryDir, { recursive: true });
+
+  // Check if file already exists under expected name
+  if (trackInfo?.artist && trackInfo?.title) {
+    const found = findExistingTrack(libraryDir, trackInfo.artist, trackInfo.title);
+    if (found) {
+      respond(id, { downloadId, status: 'started' });
+      if (m3uPath) appendToM3U(m3uPath, found, { ...(trackInfo ?? {}), url: trackInfo?.url ?? url });
+      sendMessage({ type: 'downloadDone', downloadId, success: true, track: {
+        filename: found, url: trackInfo?.url ?? url,
+        title: trackInfo?.title ?? '', artist: trackInfo?.artist ?? '',
+        duration: 0, downloadedAt: new Date().toISOString(),
+      }});
+      return;
+    }
+  }
+
+  const san = (s) => s.replace(/[/\\:*?"<>|]/g, '_').replace(/\0/g, '').trim();
+  const artist = san(trackInfo?.artist ?? 'Unknown');
+  const title = san(trackInfo?.title ?? 'Unknown');
+  const filePath = join(libraryDir, `${artist} - ${title}.mp3`);
+  const tempPath = filePath + '.part';
+
+  respond(id, { downloadId, status: 'started' });
+
+  try {
+    await new Promise((resolve, reject) => {
+      const file = createWriteStream(tempPath);
+      https.get(url, (res) => {
+        if (res.statusCode !== 200) {
+          file.destroy();
+          try { unlinkSync(tempPath); } catch {}
+          reject(new Error(`HTTP ${res.statusCode}`));
+          return;
+        }
+        res.pipe(file);
+        file.on('finish', () => file.close(() => resolve(undefined)));
+        file.on('error', (err) => { try { unlinkSync(tempPath); } catch {} reject(err); });
+      }).on('error', (err) => { try { unlinkSync(tempPath); } catch {} reject(err); });
+    });
+
+    renameSync(tempPath, filePath);
+    if (m3uPath) appendToM3U(m3uPath, filePath, { ...(trackInfo ?? {}), url: trackInfo?.url ?? url });
+    sendMessage({ type: 'downloadDone', downloadId, success: true, track: {
+      filename: filePath, url: trackInfo?.url ?? url,
+      title: trackInfo?.title ?? '', artist: trackInfo?.artist ?? '',
+      duration: 0, downloadedAt: new Date().toISOString(),
+    }});
+  } catch (err) {
+    sendMessage({ type: 'downloadDone', downloadId, success: false, error: `SC API fallback: ${err.message}` });
   }
 }
 

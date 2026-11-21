@@ -12,6 +12,7 @@ import {
   exchangeCodeForTokens,
   refreshAccessToken,
   type ScPlaylist,
+  type ScTrack,
 } from '../utils/soundcloud-api';
 
 const HOST_NAME = 'com.soundclouddl.host';
@@ -79,6 +80,9 @@ const pendingRequests = new Map<number, (val: unknown) => void>();
 const activeDownloads = new Set<string>();
 const downloadIdToUrl = new Map<string, string>(); // tracks original SC URL for library registry
 const downloadIdToBucketId = new Map<string, string>(); // tracks which bucket initiated the download
+const downloadIdToScTrackId = new Map<string, number>(); // tracks SC numeric ID for API fallback
+const downloadIdToTrackInfo = new Map<string, { title: string; artist: string }>(); // for fallback filename
+const fallbackAttempted = new Set<string>(); // download IDs where SC API fallback was already tried
 
 function getPort(): browser.Runtime.Port {
   if (nativePort) return nativePort;
@@ -103,6 +107,8 @@ function getPort(): browser.Runtime.Port {
         if (msg['success']) {
           downloadIdToUrl.delete(downloadId);
           downloadIdToBucketId.delete(downloadId);
+          downloadIdToScTrackId.delete(downloadId);
+          downloadIdToTrackInfo.delete(downloadId);
           addLog('success', `Downloaded: ${track?.title || downloadId}`);
           if (originalUrl && track?.filename) {
             libraryItem.getValue().then((lib) => {
@@ -111,9 +117,33 @@ function getPort(): browser.Runtime.Port {
           }
           dlCompleted(true);
           broadcastToScTabs(msg as unknown as TabMessage);
+        } else if (!fallbackAttempted.has(downloadId) && originalUrl) {
+          // Try SC API stream as fallback before giving up
+          tryScApiFallback(downloadId, originalUrl, bucketId).then((attempted) => {
+            if (attempted) {
+              activeDownloads.add(downloadId);
+              addLog('info', `yt-dlp failed, retrying via SC API: ${track?.title || originalUrl}`);
+              return;
+            }
+            downloadIdToUrl.delete(downloadId);
+            downloadIdToBucketId.delete(downloadId);
+            downloadIdToScTrackId.delete(downloadId);
+            downloadIdToTrackInfo.delete(downloadId);
+            addLog('error', `Download failed: ${msg['error'] as string}`);
+            if (bucketId) {
+              bucketFailuresItem.getValue().then((f) => {
+                bucketFailuresItem.setValue({ ...f, [bucketId]: (f[bucketId] ?? 0) + 1 });
+              });
+            }
+            dlCompleted(false);
+            broadcastToScTabs(msg as unknown as TabMessage);
+          });
         } else {
+          fallbackAttempted.delete(downloadId);
           downloadIdToUrl.delete(downloadId);
           downloadIdToBucketId.delete(downloadId);
+          downloadIdToScTrackId.delete(downloadId);
+          downloadIdToTrackInfo.delete(downloadId);
           addLog('error', `Download failed: ${msg['error'] as string}`);
           if (bucketId) {
             bucketFailuresItem.getValue().then((f) => {
@@ -264,6 +294,9 @@ async function handleMessage(msg: Record<string, unknown>): Promise<unknown> {
         dlQueued(1);
         downloadIdToUrl.set(downloadId, url);
         downloadIdToBucketId.set(downloadId, bucket.id);
+        if (trackInfo.title && trackInfo.artist) {
+          downloadIdToTrackInfo.set(downloadId, { title: trackInfo.title, artist: trackInfo.artist });
+        }
         sendToHost({
           action: 'download', url, trackInfo: trackInfoWithUrl, libraryDir, m3uPath: bucket.m3uPath,
           downloadId, format: settings.format, quality: settings.quality, embedArt: settings.embedArt,
@@ -523,7 +556,11 @@ async function syncBucket(bucketId: string): Promise<SyncResult> {
     await syncedUrlsItem.setValue(cleanedUrlMap);
   }
 
-  const newTracks = tracks.filter((t) => t.streamable && !syncedIds.has(String(t.id)));
+  // A track needs processing if it was never synced, OR if it was synced but its file path
+  // never made it into the library registry (e.g. --no-overwrites silent skip on a previous run).
+  const newTracks = tracks.filter(
+    (t) => t.streamable && !(syncedIds.has(String(t.id)) && library[t.permalink_url])
+  );
 
   // Mark as synced immediately to prevent re-queuing on rapid re-sync
   await syncedItem.setValue([...syncedIds, ...newTracks.map((t) => String(t.id))]);
@@ -550,6 +587,8 @@ async function syncBucket(bucketId: string): Promise<SyncResult> {
       dlQueued(1);
       downloadIdToUrl.set(downloadId, track.permalink_url);
       downloadIdToBucketId.set(downloadId, bucketId);
+      downloadIdToScTrackId.set(downloadId, track.id);
+      downloadIdToTrackInfo.set(downloadId, { title: track.title, artist: track.user.username });
       sendToHost({
         action: 'download',
         url: track.permalink_url,
@@ -558,6 +597,20 @@ async function syncBucket(bucketId: string): Promise<SyncResult> {
         format: settings.format, quality: settings.quality, embedArt: settings.embedArt,
       }).then(() => activeDownloads.delete(downloadId));
     }
+  }
+
+  // Reconcile previously-synced tracks into the M3U. appendToM3U on the host deduplicates by
+  // filepath, so this is safe to call every sync and covers cases where the M3U was out of date.
+  const alreadySyncedInLibrary = tracks.filter(
+    (t) => syncedIds.has(String(t.id)) && library[t.permalink_url]
+  );
+  for (const track of alreadySyncedInLibrary) {
+    sendToHost({
+      action: 'addToM3U',
+      m3uPath: bucket.m3uPath,
+      filePath: library[track.permalink_url]!,
+      trackInfo: { title: track.title, artist: track.user.username, url: track.permalink_url },
+    });
   }
 
   // Update lastSyncedAt on the bucket
@@ -612,4 +665,44 @@ async function getValidToken(): Promise<string> {
   }
 
   return sc.accessToken;
+}
+
+async function tryScApiFallback(downloadId: string, originalUrl: string, bucketId: string | undefined): Promise<boolean> {
+  try {
+    const [settings, buckets] = await Promise.all([settingsItem.getValue(), bucketsItem.getValue()]);
+    if (!settings.sc?.accessToken || !settings.rootDir) return false;
+
+    const bucket = bucketId ? buckets.find((b) => b.id === bucketId) : null;
+    if (!bucket) return false;
+
+    const token = await getValidToken();
+
+    // Use stored track ID when available (sync downloads), otherwise resolve the URL
+    let trackId = downloadIdToScTrackId.get(downloadId);
+    let trackInfo = downloadIdToTrackInfo.get(downloadId);
+    if (!trackId) {
+      const clientId = settings.sc.clientId;
+      if (!clientId) return false;
+      const resolved = await resolveScUrl(originalUrl, clientId);
+      if (!('streamable' in resolved)) return false;
+      const scTrack = resolved as ScTrack;
+      if (!scTrack.streamable) return false;
+      trackId = scTrack.id;
+      trackInfo = { title: scTrack.title, artist: scTrack.user.username };
+    }
+
+    const streamUrl = await fetchStreamUrl(trackId, token);
+    fallbackAttempted.add(downloadId);
+    sendToHost({
+      action: 'downloadDirect',
+      url: streamUrl,
+      downloadId,
+      m3uPath: bucket.m3uPath,
+      libraryDir: `${settings.rootDir}/library`,
+      trackInfo: trackInfo ? { ...trackInfo, url: originalUrl } : { url: originalUrl },
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
